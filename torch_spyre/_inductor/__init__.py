@@ -16,6 +16,7 @@ from .constants import DEVICE_NAME
 from .patches import enable_spyre_context, patch_inductor_fusions
 from . import config
 
+import os
 import threading
 from functools import wraps
 from typing import Any
@@ -209,6 +210,32 @@ def _light_autoload():
     enable_spyre_compile_fx_wrapper()
 
 
+# Name of the ``scan`` higher-order op as PyTorch's cache checks see it.
+_SCAN_HOP_NAME = "torch.ops.higher_order.scan"
+# Salt for the cache key of graphs that contain ``scan``. Change it to drop
+# every cached graph that has a ``scan`` in it.
+_SCAN_CACHE_SALT = "torch-spyre-scan-v1"
+
+
+def _allow_scan_graph_caching() -> None:
+    """Let the FX graph and AOTAutograd caches keep graphs that use ``scan``.
+
+    Opt-in with ``TORCH_SPYRE_CACHE_SCAN=1``. ``for_each_tile`` (used by the
+    SDPA K/V loop) is the ``scan`` op, and PyTorch skips the caches for any
+    graph with a higher-order op it does not know is cacheable. So every
+    SDPA with more than one K/V block is compiled again in every process.
+    The ``scan`` body is a subgraph of the cached graph and is part of the
+    cache key like the rest of the graph; the salt is added to the key too.
+    """
+    if os.environ.get("TORCH_SPYRE_CACHE_SCAN", "0") != "1":
+        return
+    import torch._inductor.config as inductor_config
+
+    marked = dict(inductor_config.unsafe_marked_cacheable_functions)
+    marked.setdefault(_SCAN_HOP_NAME, _SCAN_CACHE_SALT)
+    inductor_config.unsafe_marked_cacheable_functions = marked
+
+
 def _autoload():
     if getattr(_autoload, "_ran", False):
         return
@@ -246,5 +273,7 @@ def _autoload():
             SpyrePythonWrapperCodegen,
             device_custom_config=config,
         )
+
+        _allow_scan_graph_caching()
 
         _autoload._ran = True
