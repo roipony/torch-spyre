@@ -226,6 +226,12 @@ def _allow_scan_graph_caching() -> None:
     SDPA with more than one K/V block is compiled again in every process.
     The ``scan`` body is a subgraph of the cached graph and is part of the
     cache key like the rest of the graph; the salt is added to the key too.
+
+    What "unsafe" leaves to us: PyTorch does not check that ``scan`` itself
+    is safe to cache. Tensors used inside the body are hashed by value (or
+    are graph inputs), except non-inlined frozen parameters, which are hashed
+    by metadata only, as for any other graph. A change to ``scan`` in PyTorch
+    is not in the key: bump ``_SCAN_CACHE_SALT`` to drop old entries.
     """
     if os.environ.get("TORCH_SPYRE_CACHE_SCAN", "0") != "1":
         return

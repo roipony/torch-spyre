@@ -119,3 +119,34 @@ def test_flag_off_bypasses_scan_graph():
         hit, _, bypass = _fx_counts()
         assert hit == 0
         assert bypass >= 2
+
+
+def _make_scaled_scan(scale):
+    c = torch.full((8,), scale)
+
+    def fn(xs):
+        def body(carry, x):
+            new = carry + x * c
+            return new, new.clone()
+
+        return scan(body, torch.zeros_like(xs[0]), xs)
+
+    return fn
+
+
+def test_flag_on_new_captured_constant_gives_right_result():
+    """A scan body that differs only in a captured tensor is not served stale."""
+    xs = torch.randn(4, 8)
+    with (
+        mock.patch.dict("os.environ", {"TORCH_SPYRE_CACHE_SCAN": "1"}),
+        inductor_config.patch(
+            unsafe_marked_cacheable_functions={},
+            fx_graph_cache=True,
+            fx_graph_remote_cache=False,
+        ),
+        fresh_cache(),
+    ):
+        _allow_scan_graph_caching()
+        for scale in (2.0, 3.0):
+            fn = _make_scaled_scan(scale)
+            torch.testing.assert_close(_compile_once(fn, xs), fn(xs))
