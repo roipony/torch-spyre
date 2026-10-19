@@ -17,15 +17,18 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import dataclasses
+import functools
 import math
 import threading
 from typing import Any, Literal, Sequence
 
 from sympy import Symbol, Expr, Function, sympify
+from sympy.core.parameters import global_parameters
 from torch_spyre._C import DataFormats, ElementArrangement
 import torch
 from torch_spyre import _C
 
+from . import config as _spyre_config
 from .constants import IDENTITY_OP
 
 
@@ -44,6 +47,27 @@ class IndirectAccess(Function):
     @classmethod
     def eval(cls, name):  # noqa: ARG003
         return None  # keep unevaluated
+
+
+@functools.lru_cache(maxsize=None)
+def _cached_sympify(text: str, evaluate: bool) -> Any:
+    # ``evaluate`` only keys the cache: sympify reads the same global flag.
+    return sympify(text)
+
+
+def wrapper_sympify(a: Any, *args: Any, **kwargs: Any) -> Any:
+    """``sympify`` as imported by generated Spyre wrapper modules.
+
+    The wrapper emits ``sympify('<expr>')`` for every index expression, and each
+    load of a cached wrapper module re-parses those strings. With
+    ``config.sympify_cache`` (``TORCH_SPYRE_SYMPIFY_CACHE=1``) a plain ``str``
+    argument is parsed once per process and the parsed expression is shared;
+    sympy expressions are immutable, so sharing them is safe. Anything else,
+    and every call when the switch is off, goes straight to ``sympy.sympify``.
+    """
+    if not args and not kwargs and type(a) is str and _spyre_config.sympify_cache:
+        return _cached_sympify(a, global_parameters.evaluate)
+    return sympify(a, *args, **kwargs)
 
 
 # --- Source-to-kernel provenance schema -------------------------------------

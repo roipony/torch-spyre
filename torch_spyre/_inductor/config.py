@@ -421,6 +421,15 @@ _cache_config_ignore_prefix: list[str] = [
     # The CP-SAT worker count: an explicit SPYRE_NUM_CPUS or patch would
     # otherwise split the cache by machine for identical graphs.
     "num_cpus",
+    # The generated code is the same with or without the sympify memo.
+    "sympify_cache",
 ]
+
+# Memoize the sympify('<expr>') calls in generated Spyre wrapper modules, so a
+# process parses each distinct expression string once instead of on every
+# load of a cached wrapper module. Read at call time by
+# op_spec.wrapper_sympify; the generated code is the same either way, so it is
+# left out of the cache key. Off by default; set TORCH_SPYRE_SYMPIFY_CACHE=1.
+sympify_cache: bool = os.environ.get("TORCH_SPYRE_SYMPIFY_CACHE", "0") == "1"
 
 install_config_module(sys.modules[__name__])
