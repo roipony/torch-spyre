@@ -141,7 +141,11 @@ class TestWrapperSympify(unittest.TestCase):
         # The generated code must be identical with the switch on and off.
         for module in (wrapper, spyre_kernel):
             self.assertNotIn("sympify_cache", inspect.getsource(module))
-        header = inspect.getsource(wrapper.SpyrePythonWrapperCodegen.write_header)
+        self.assertIn(
+            "SPYRE_WRAPPER_IMPORTS",
+            inspect.getsource(wrapper.SpyrePythonWrapperCodegen.write_header),
+        )
+        header = wrapper.SPYRE_WRAPPER_IMPORTS
         self.assertIn(
             "from torch_spyre._inductor.op_spec import wrapper_sympify as sympify",
             header,
