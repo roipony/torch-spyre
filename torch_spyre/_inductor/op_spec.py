@@ -28,7 +28,6 @@ from torch_spyre._C import DataFormats, ElementArrangement
 import torch
 from torch_spyre import _C
 
-from . import config as _spyre_config
 from .constants import IDENTITY_OP
 
 
@@ -49,7 +48,9 @@ class IndirectAccess(Function):
         return None  # keep unevaluated
 
 
-@functools.lru_cache(maxsize=None)
+# Bounded so that a long-lived process compiling many shapes cannot grow it
+# without limit; a Granite 3.3 8B start parses about 105 distinct strings.
+@functools.lru_cache(maxsize=4096)
 def _cached_sympify(text: str, evaluate: bool) -> Any:
     # ``evaluate`` only keys the cache: sympify reads the same global flag.
     return sympify(text)
@@ -59,13 +60,12 @@ def wrapper_sympify(a: Any, *args: Any, **kwargs: Any) -> Any:
     """``sympify`` as imported by generated Spyre wrapper modules.
 
     The wrapper emits ``sympify('<expr>')`` for every index expression, and each
-    load of a cached wrapper module re-parses those strings. With
-    ``config.sympify_cache`` (``TORCH_SPYRE_SYMPIFY_CACHE=1``) a plain ``str``
+    load of a cached wrapper module re-parses those strings. A plain ``str``
     argument is parsed once per process and the parsed expression is shared;
-    sympy expressions are immutable, so sharing them is safe. Anything else,
-    and every call when the switch is off, goes straight to ``sympy.sympify``.
+    sympy expressions are immutable, so sharing them is safe. Anything else
+    goes straight to ``sympy.sympify``.
     """
-    if not args and not kwargs and type(a) is str and _spyre_config.sympify_cache:
+    if not args and not kwargs and type(a) is str:
         return _cached_sympify(a, global_parameters.evaluate)
     return sympify(a, *args, **kwargs)
 

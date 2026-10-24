@@ -15,6 +15,7 @@
 import os
 import sys
 from typing import Literal
+import warnings
 
 from torch.utils._config_module import install_config_module
 
@@ -422,16 +423,25 @@ _cache_config_ignore_prefix: list[str] = [
     # otherwise split the cache by machine for identical graphs.
     "num_cpus",
     # Read at call time; the generated code is the same for every value.
-    "sympify_cache",
     "precomputed_kernel_key",
 ]
 
-# Memoize the sympify('<expr>') calls in generated Spyre wrapper modules, so a
-# process parses each distinct expression string once instead of on every
-# load of a cached wrapper module. Read at call time by
-# op_spec.wrapper_sympify; the generated code is the same either way, so it is
-# left out of the cache key. Off by default; set TORCH_SPYRE_SYMPIFY_CACHE=1.
-sympify_cache: bool = os.environ.get("TORCH_SPYRE_SYMPIFY_CACHE", "0") == "1"
+
+def _precomputed_kernel_key_from_env() -> str:
+    value = os.environ.get("TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY", "0")
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes"):
+        return "1"
+    if normalized == "verify":
+        return "verify"
+    if normalized not in ("", "0", "false", "no"):
+        warnings.warn(
+            "TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY must be 1/true/yes, verify or "
+            f"0/false/no, got {value!r}; leaving it off",
+            stacklevel=2,
+        )
+    return "0"
+
 
 # Trust the kernel-cache key that codegen stored in the generated wrapper.
 # Every async_compile.sdsc(...) call carries precomputed_key="<key>|<fp>"
@@ -446,9 +456,8 @@ sympify_cache: bool = os.environ.get("TORCH_SPYRE_SYMPIFY_CACHE", "0") == "1"
 # mismatch falls back to compute_specs_hash(). "verify" computes both and
 # raises PrecomputedKernelKeyMismatch if they differ (for tests). Read at call
 # time; the generated code is the same for every value, so it is left out of
-# the cache key. Off by default; set TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY=1.
-precomputed_kernel_key: str = (
-    os.environ.get("TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY", "0").strip().lower()
-)
+# the cache key. Off by default; set TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY=1
+# (true and yes work too). Any other value warns and leaves it off.
+precomputed_kernel_key: str = _precomputed_kernel_key_from_env()
 
 install_config_module(sys.modules[__name__])

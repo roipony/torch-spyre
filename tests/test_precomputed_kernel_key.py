@@ -23,10 +23,12 @@ Run with:
 """
 
 import contextlib
+import os
 import shutil
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+import warnings
 
 import sympy
 import torch
@@ -584,6 +586,41 @@ class TestEmittedSdscCall(unittest.TestCase):
             )
         self.assertEqual(name, "sdsc_existing_0")
         wrapper.define_kernel.assert_not_called()
+
+
+class TestSwitchValues(unittest.TestCase):
+    _VAR = "TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY"
+
+    def _parse(self, value):
+        env = dict(os.environ)
+        env.pop(self._VAR, None)
+        if value is not None:
+            env[self._VAR] = value
+        with patch.dict(os.environ, env, clear=True):
+            return spyre_config._precomputed_kernel_key_from_env()
+
+    def test_known_values(self):
+        cases = {
+            None: "0",
+            "": "0",
+            "0": "0",
+            "false": "0",
+            "no": "0",
+            "1": "1",
+            "true": "1",
+            " YES ": "1",
+            "verify": "verify",
+            "Verify": "verify",
+        }
+        for value, expected in cases.items():
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                self.assertEqual(self._parse(value), expected, value)
+
+    def test_unknown_value_warns_and_stays_off(self):
+        for value in ("on", "2", "verfy"):
+            with self.assertWarnsRegex(UserWarning, self._VAR):
+                self.assertEqual(self._parse(value), "0", value)
 
 
 if __name__ == "__main__":

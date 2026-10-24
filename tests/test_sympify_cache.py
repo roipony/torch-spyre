@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU-only tests for TORCH_SPYRE_SYMPIFY_CACHE (memoized wrapper sympify).
+"""CPU-only tests for the memoized sympify of generated wrapper modules.
 
 Run with:
     python -m pytest tests/test_sympify_cache.py -v
@@ -24,8 +24,7 @@ import unittest
 import sympy
 from sympy.core.parameters import evaluate
 
-import torch_spyre._inductor.config as spyre_config
-from torch_spyre._inductor import op_spec, spyre_kernel, wrapper
+from torch_spyre._inductor import wrapper
 from torch_spyre._inductor.op_spec import _cached_sympify, wrapper_sympify
 
 # Expression strings as emitted by sympy_str() into generated wrapper modules.
@@ -72,23 +71,19 @@ class TestWrapperSympify(unittest.TestCase):
     def tearDown(self):
         _cached_sympify.cache_clear()
 
-    def test_on_equals_off_equals_sympy(self):
-        with spyre_config.patch(sympify_cache=False):
-            off = [wrapper_sympify(s) for s in _EXPRS]
-        with spyre_config.patch(sympify_cache=True):
-            on = [wrapper_sympify(s) for s in _EXPRS]
-            on_again = [wrapper_sympify(s) for s in _EXPRS]
-        for text, a, b, c in zip(_EXPRS, off, on, on_again):
+    def test_cold_and_cached_equal_sympy(self):
+        cold = [wrapper_sympify(s) for s in _EXPRS]
+        cached = [wrapper_sympify(s) for s in _EXPRS]
+        for text, a, b in zip(_EXPRS, cold, cached):
             ref = sympy.sympify(text)
-            for got in (a, b, c):
+            for got in (a, b):
                 self.assertEqual(got, ref, text)
                 self.assertEqual(_signature(got), _signature(ref), text)
 
     def test_cache_hit_returns_equal_object(self):
-        with spyre_config.patch(sympify_cache=True):
-            first = wrapper_sympify("Mod(floor(core_id/8), 4)")
-            hits = _cached_sympify.cache_info().hits
-            second = wrapper_sympify("Mod(floor(core_id/8), 4)")
+        first = wrapper_sympify("Mod(floor(core_id/8), 4)")
+        hits = _cached_sympify.cache_info().hits
+        second = wrapper_sympify("Mod(floor(core_id/8), 4)")
         self.assertEqual(_cached_sympify.cache_info().hits, hits + 1)
         self.assertEqual(second, first)
         self.assertIs(second, first)
@@ -97,50 +92,42 @@ class TestWrapperSympify(unittest.TestCase):
     def test_non_str_passes_through(self):
         c0 = sympy.Symbol("c0")
         args = [4, 2.5, c0, sympy.Integer(7), sympy.floor(c0 / 32), [1, "c0"]]
-        with spyre_config.patch(sympify_cache=True):
-            for a in args:
-                self.assertEqual(wrapper_sympify(a), sympy.sympify(a))
-            # Extra sympify arguments also bypass the cache.
-            got = wrapper_sympify("0.5*c0", rational=True)
-            self.assertEqual(got, sympy.sympify("0.5*c0", rational=True))
+        for a in args:
+            self.assertEqual(wrapper_sympify(a), sympy.sympify(a))
+        # Extra sympify arguments also bypass the cache.
+        got = wrapper_sympify("0.5*c0", rational=True)
+        self.assertEqual(got, sympy.sympify("0.5*c0", rational=True))
         self.assertEqual(_cached_sympify.cache_info().currsize, 0)
 
-    def test_off_never_caches(self):
-        with spyre_config.patch(sympify_cache=False):
-            for s in _EXPRS + _EXPRS:
-                wrapper_sympify(s)
-        info = _cached_sympify.cache_info()
-        self.assertEqual((info.hits, info.misses, info.currsize), (0, 0, 0))
+    def test_cache_is_bounded(self):
+        maxsize = _cached_sympify.cache_info().maxsize
+        self.assertIsNotNone(maxsize)
+        self.assertGreaterEqual(maxsize, 1024)
 
     def test_evaluate_flag_is_honoured(self):
         text = "2*3 + c0"
-        with spyre_config.patch(sympify_cache=True):
-            evaluated = wrapper_sympify(text)
-            with evaluate(False):
-                unevaluated = wrapper_sympify(text)
-                ref = sympy.sympify(text)
+        evaluated = wrapper_sympify(text)
+        with evaluate(False):
+            unevaluated = wrapper_sympify(text)
+            ref = sympy.sympify(text)
         self.assertEqual(sympy.srepr(unevaluated), sympy.srepr(ref))
         self.assertEqual(evaluated, sympy.sympify(text))
         self.assertNotEqual(sympy.srepr(evaluated), sympy.srepr(unevaluated))
 
-    def test_generated_fragment_on_equals_off(self):
+    def test_generated_fragment_equals_sympy(self):
         results = []
-        for on in (False, True, True):
+        for _ in range(2):  # cold, then cached
             ns = {}
             exec(
                 "from torch_spyre._inductor.op_spec import wrapper_sympify as sympify",
                 ns,
             )
-            with spyre_config.patch(sympify_cache=on):
-                results.append(eval(_GENERATED, ns))
+            results.append(eval(_GENERATED, ns))
         ref = eval(_GENERATED, {"sympify": sympy.sympify})
         for got in results:
             self.assertEqual(got, ref)
 
-    def test_codegen_does_not_read_switch(self):
-        # The generated code must be identical with the switch on and off.
-        for module in (wrapper, spyre_kernel):
-            self.assertNotIn("sympify_cache", inspect.getsource(module))
+    def test_wrapper_header_imports_wrapper_sympify(self):
         self.assertIn(
             "SPYRE_WRAPPER_IMPORTS",
             inspect.getsource(wrapper.SpyrePythonWrapperCodegen.write_header),
@@ -150,7 +137,6 @@ class TestWrapperSympify(unittest.TestCase):
             "from torch_spyre._inductor.op_spec import wrapper_sympify as sympify",
             header,
         )
-        self.assertIn("sympify_cache", inspect.getsource(op_spec.wrapper_sympify))
 
 
 if __name__ == "__main__":
