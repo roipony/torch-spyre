@@ -45,8 +45,8 @@ from ..core_mapping import (
     select_unique_partition_division,
     transfer_edges,
 )
-from ..cost_model import OpFeatures, relayout_ns
-from ..dump_cost_model import governing_run_split
+from ..cost_model import CostParams, relayout_ns
+from ..dump_cost_model import relayout_cost_features
 from ..ir import FixedTiledLayout
 from ..loop_info import CoarseTileInfo
 from ..logging_utils import get_inductor_logger
@@ -73,6 +73,8 @@ _REGISTRY = "_spyre_lx_relayout_copies"
 # larger gather can fail register initialization even when individual cores
 # need fewer distinct values. Apply this conservative bound before placement.
 _MAX_SHUFFLE_FANIN = 8
+# Largest governing split the solver may be offered for a GROUPED movement.
+_GROUPED_SPLIT_MAX = 8
 
 
 @dataclasses.dataclass(frozen=True)
@@ -150,10 +152,11 @@ class RelayoutCandidate:
 
     @property
     def destination_num_cores(self) -> int:
-        """The consumer's core count, carried by the destination view: equal to
-        ``num_cores`` for permutations and gathers, a multiple of it for a
-        broadcast (#3440), where the copy lives on the destination's cores while
-        the plan's ``num_cores`` stays the source's."""
+        """The destination view's physical core count.
+
+        The copy lives on these cores. The plan's ``num_cores`` remains the
+        source count, including when the two domains differ.
+        """
         return cast(int, self.destination_view.num_cores)
 
     def __post_init__(self) -> None:
@@ -539,12 +542,14 @@ def movement_supported(
     source_num_cores: int,
     destination_num_cores: int,
 ) -> bool:
-    """Extend the original full-partition check to gathers and broadcasts.
+    """Certify uniform partition transfers, gathers and broadcasts.
 
     Edges are ownership intersections, never a separate geometry calculation.
     A complete source may feed uniformly repeated destination slices. Across
-    unequal core counts, only even broadcasts (one source per destination) are
-    supported. Equal destination slices have identical sources by construction.
+    unequal core counts, a larger complete destination partition may gather
+    several disjoint source fragments. Replicated destinations retain the
+    one-source broadcast rule. Equal destination slices have identical sources
+    by construction.
     Incoming fragments must also fit the current shuffle lowering's address
     register budget; broadcast fan-out does not consume this budget.
     """
@@ -613,9 +618,16 @@ def movement_supported(
         return False
     if max(fanin) > _MAX_SHUFFLE_FANIN:
         return False
-    # A larger domain only broadcasts: one source per destination.
-    return source_num_cores == destination_num_cores or (
-        fanout[0] == destination_num_cores // source_num_cores and fanin[0] == 1
+    # A complete destination is an exact repartition, including an expansion
+    # onto more cores. The shuffle's per-tensor maps describe the two domains;
+    # STCDP intersects their pieces rather than assuming one source per reader.
+    # Keep the narrower existing rule for replicated larger destinations.
+    # The guards above require every destination slice to be present. With
+    # as many distinct slices as cores, each core therefore owns one slice.
+    return (
+        source_num_cores == destination_num_cores
+        or destination_slices == destination_num_cores
+        or (fanout[0] == destination_num_cores // source_num_cores and fanin[0] == 1)
     )
 
 
@@ -623,28 +635,31 @@ def core_domain_rejection(source_num_cores: int, consumer_num_cores: int) -> str
     """Why a producer on ``source_num_cores`` may not feed a consumer on
     ``consumer_num_cores`` through a relayout, from the core counts alone, or
     ``None`` when they are compatible. Equal counts are always fine
-    (permutations and gathers). A larger consumer domain is a grouped broadcast
-    (#3440), which the emitter supports only onto every compute core; the
-    geometric half of that rule (an even multiple, one source per destination
-    core) is :func:`movement_supported`'s. Shared by the committed collector and
-    the solver's enumeration so the two paths cannot drift."""
+    (permutations and gathers). A larger consumer domain is either a complete
+    repartition or a grouped broadcast, supported only onto every compute core.
+    The geometric half of that rule is :func:`movement_supported`'s.
+    Shared by the committed collector and the solver's enumeration so the two
+    paths cannot drift."""
     if consumer_num_cores < source_num_cores:
         return "cannot emit: consumer uses fewer physical cores than producer"
     if consumer_num_cores > source_num_cores and consumer_num_cores != config.sencores:
-        return "cannot emit: grouped broadcast must target all compute cores"
+        return "cannot emit: larger relayout domain must target all compute cores"
     return None
 
 
 def grouped_gather_rejection(
     consumer: Operation, source_num_cores: int, destination_view: PerCoreView
 ) -> str | None:
-    """Why ``consumer``'s ``destination_view`` may not be a grouped gather of a
-    producer on ``source_num_cores``, or ``None``. A destination with fewer
-    owners than the source has cores assembles each slice from several source
-    slices (#3440), which the emitter supports for a matmul consumer only; a
-    complete partition (a permutation) or a broadcast is not a gather and passes.
-    The consumer half of the rule; the geometry is :func:`movement_supported`'s.
-    Shared by the committed collector and the solver's enumeration."""
+    """Reject a replicated grouped gather without a matmul consumer.
+
+    A #3440 grouped gather repeats assembled destination slices across cores.
+    This replicated layout supports matmul consumers only.
+    A complete destination partition has no replicas. Shuffle lowering can
+    assemble its disjoint source pieces for a pointwise consumer too, including
+    expansion onto more cores. ``movement_supported`` checks its uniform
+    routes and fan-in bound. Both candidate pricing and committed copies use
+    this consumer rule.
+    """
     owners = math.prod(dict(destination_view.work_slice_dims).values())
     if owners < source_num_cores and not _is_matmul_op(consumer):
         return "cannot emit: grouped gather requires a matmul consumer"
@@ -796,7 +811,8 @@ def solver_relayout_edge_context(
     producer_loop_info = getattr(producer, "loop_info", None)
     consumer_loop_info = getattr(consumer, "loop_info", None)
     same_tile_group = (
-        isinstance(producer_loop_info, CoarseTileInfo)
+        config.lx_same_tile_group_relayout
+        and isinstance(producer_loop_info, CoarseTileInfo)
         and isinstance(consumer_loop_info, CoarseTileInfo)
         and producer_loop_info.loop_group_id == consumer_loop_info.loop_group_id
         and not (
@@ -863,58 +879,48 @@ def solver_relayout_pair_cost(
 ) -> float | None:
     """Price one candidate relayout (source view -> destination view), in ns.
 
-    ``None`` when the pair cannot host a relayout, or should not be offered:
+    Return ``None`` for matching ownership, unsupported movement, or a split
+    outside the measured range. Permutations use the cost model's split range;
+    grouped movements use [``relayout_split_min``, ``_GROUPED_SPLIT_MAX``].
+    The caller also applies the consumer's core-domain and gather rules.
 
-    - views with the same physical ownership need no relayout (that pair
-      belongs to ``cd_parent_matches``), compared with ``same_partition`` so a
-      differently spelled slot expression cannot masquerade as movement;
-    - ``movement_supported``, the committed path's own gate (#3440), admits
-      what the emitter can move: uniform permutations, grouped gathers and
-      grouped broadcasts, so the solver never prices a movement the emitter
-      cannot execute; the enumeration adds the collector's consumer rules
-      (:func:`core_domain_rejection`, :func:`grouped_gather_rejection`) on top. A
-      grouped movement is priced by the same law as a permutation of the same
-      tensor on the SOURCE's cores, keyed on the finer side's geometry as
-      always: ``cores=num_cores`` makes the law's per-core bytes the source
-      slice, which is what every destination core receives in a broadcast. The
-      grouped-relayout sweep (2026-09-09, 43 rows) measured the grouped
-      shuffle's marginal cost at or below that law (<= 0.3 us gathers, <= 1.6
-      us broadcasts, flat in fan-out), so this over-states, never under-states,
-      the shuffle; the decision is dominated by the consumer's replicated HBM
-      re-read on the demote side, priced by the cost model since #4454;
-    - a governing split outside the law's fitted range [2, 8] is DECLINED, not
-      clamped: the reporting path clamps because the shuffle it prices already
-      exists, but the solver must never be offered an option at a price the
-      law was not fitted for.
+    Unequal complete partitions use the same estimate on the smaller domain;
+    this is not a separately fitted law.
+    It charges more than the larger-domain formula, not a proven upper bound
+    on hardware time.
 
-    The price is ``relayout_ns`` on a minimal feature vector - the same function
-    the reporting path uses, so the two paths cannot drift.
-
-    Each view must be built FOR its own core count (every core's owner slot
-    within its split): the source for ``num_cores``, the destination for
-    ``destination_num_cores`` (the source's count when omitted). The caller's
-    cores_used gates guarantee that, and ``_core_slices`` asserts it rather
-    than tolerating an out-of-range slot.
+    Use the reporting path's feature vector and ``relayout_ns`` with the finer
+    view's geometry. Build each view for its own core
+    count: ``num_cores`` for the source and ``destination_num_cores`` for the
+    destination (defaults to the source's count).
     """
-    run_elems, split = governing_run_split(source_view, destination_view, device_dims)
-    if run_elems <= 0 or not 2 <= split <= 8:
+    features = relayout_cost_features(
+        source_view,
+        destination_view,
+        num_cores,
+        device_dims,
+        out_elems,
+        dtype_bytes,
+        destination_num_cores=destination_num_cores,
+    )
+    run_elems, split = features.relayout_run_elems, features.relayout_split
+    p = params or CostParams()
+    complete_partition = (
+        source_view.split_product == num_cores
+        and destination_view.split_product == (destination_num_cores or num_cores)
+    )
+    # A complete repartition moves each element once, with no destination
+    # replicas. Use the partition law's range and retain the
+    # smaller core count below: the larger slice governs send or receive work.
+    # This is an estimate for unequal domains, not a new measured cost law.
+    top = p.relayout_split_max if complete_partition else _GROUPED_SPLIT_MAX
+    if run_elems <= 0 or not p.relayout_split_min <= split <= top:
         return None
     if not movement_supported(
         source_view, destination_view, num_cores, destination_num_cores or num_cores
     ):
         return None
-    features = OpFeatures(
-        name="lx_relayout",
-        is_reduction=False,
-        out_elems=out_elems,
-        cores=num_cores,
-        dtype_bytes=dtype_bytes,
-        args=[],
-        is_lx_relayout=True,
-        relayout_run_elems=run_elems,
-        relayout_split=split,
-    )
-    return relayout_ns(features, params)
+    return relayout_ns(features, p)
 
 
 def collect_lx_relayout_plans(
