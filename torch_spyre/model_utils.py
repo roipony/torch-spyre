@@ -72,9 +72,9 @@ Usage::
 """
 
 import functools
-import os
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, NamedTuple
 
 import torch
@@ -100,10 +100,10 @@ logger = get_inductor_logger("model_utils")
 # Most of the time of a weight upload is spent on the host, turning the data
 # into the device format. copy_tensor lets go of the GIL while it works, so
 # load_model_to_spyre can upload several tensors at the same time from a few
-# threads. TORCH_SPYRE_UPLOAD_THREADS sets the number of threads; 1 uploads
-# one tensor at a time, as before.
-_UPLOAD_THREADS_ENV = "TORCH_SPYRE_UPLOAD_THREADS"
-_MAX_DEFAULT_UPLOAD_THREADS = 8
+# threads. Each thread takes a stream from the pool of 32, and a stream may get
+# work from only one thread, so the count stays well below that.
+_DEFAULT_UPLOAD_THREADS = 8
+_MAX_UPLOAD_THREADS = 16
 
 
 def _ensure_spyre_runtime() -> None:
@@ -203,6 +203,24 @@ def _dma_to_spyre_dim_order_swapped(
     return dst
 
 
+def _embedding_stick_size(weight: torch.Tensor, dev_dtype: torch.dtype) -> int | None:
+    """Elements per stick, if they tile the hidden dim of the 2D ``weight``;
+    otherwise warn and return None."""
+    d = weight.shape[1]
+    # elems_per_stick is dtype-aware (64 at fp16/bf16, 32 at fp32), so query it
+    # rather than hardcoding a stick size.
+    eps = SpyreTensorLayout(list(weight.shape), dev_dtype).elems_per_stick()
+    if d % eps == 0:
+        return eps
+    warnings.warn(
+        f"Embedding hidden dim {d} is not a multiple of the Spyre stick "
+        f"size {eps} for dtype {dev_dtype}; falling back to the default "
+        "layout (no gather optimization) for this embedding table.",
+        stacklevel=3,
+    )
+    return None
+
+
 def _dma_to_spyre_indirect_access(
     weight: torch.Tensor,
     target_dtype: torch.dtype | None = None,
@@ -237,16 +255,8 @@ def _dma_to_spyre_indirect_access(
     dev_dtype = target_dtype if target_dtype is not None else weight.dtype
 
     rows, d = weight.shape
-    # elems_per_stick is dtype-aware (64 at fp16/bf16, 32 at fp32), so query it
-    # rather than hardcoding a stick size.
-    eps = SpyreTensorLayout(list(weight.shape), dev_dtype).elems_per_stick()
-    if d % eps != 0:
-        warnings.warn(
-            f"Embedding hidden dim {d} is not a multiple of the Spyre stick "
-            f"size {eps} for dtype {dev_dtype}; falling back to the default "
-            "layout (no gather optimization) for this embedding table.",
-            stacklevel=2,
-        )
+    eps = _embedding_stick_size(weight, dev_dtype)
+    if eps is None:
         return None
 
     layout = SpyreTensorLayout(
@@ -413,16 +423,23 @@ def _transfer_module(
     uploads: list[_Upload],
     prefix: str = "",
     use_fp8_weights: bool = False,
+    seen: set[nn.Module] | None = None,
 ) -> None:
     """Recursively list ``module``'s params/buffers to move to Spyre.
 
     Mirrors ``nn.Module._apply``'s virtual recursion: a submodule that overrides
     ``_apply`` is delegated to and pruned from the walk; its tensors are moved
     right away, one at a time. For all other modules, each parameter and buffer
-    is added to ``uploads`` in walk order; ``_run_uploads`` moves them.
+    is added to ``uploads``; ``_run_uploads`` moves them. A module reachable by
+    two paths (such as ``torch.compile``'s ``_orig_mod``) is visited once.
     Tensors already on Spyre are skipped (idempotent). ``prefix`` is the
     module's dotted path (as in ``named_modules``) for logs.
     """
+    if seen is None:
+        seen = set()
+    if module in seen:
+        return
+    seen.add(module)
     if _module_overrides_apply(module):
         module._apply(
             lambda t: (
@@ -435,19 +452,29 @@ def _transfer_module(
 
     for child_name, child in module.named_children():
         child_prefix = f"{prefix}.{child_name}" if prefix else child_name
-        _transfer_module(child, dtype, uploads, child_prefix, use_fp8_weights)
+        _transfer_module(child, dtype, uploads, child_prefix, use_fp8_weights, seen)
 
     is_linear = isinstance(module, nn.Linear)
     is_embedding = isinstance(module, nn.Embedding)
     for name, param in list(module._parameters.items()):
         if param is None or param.device.type == DEVICE_NAME:
             continue
+        # Checked here so the fallback warning comes from the caller's thread.
+        indirect = (
+            is_embedding
+            and name == "weight"
+            and param.ndim == 2
+            and _embedding_stick_size(
+                param, dtype if dtype is not None else param.dtype
+            )
+            is not None
+        )
         run = functools.partial(
             _upload_parameter,
             param.data,
             name,
             is_linear,
-            is_embedding,
+            indirect,
             dtype,
             prefix,
             use_fp8_weights,
@@ -538,25 +565,15 @@ def _upload_buffer(
     return _dma_to_spyre_default(buf, target_dtype=dtype), "buffer"
 
 
-def _cpu_count() -> int:
-    """Number of CPUs this process can use, including a cgroup CPU limit."""
-    count = len(os.sched_getaffinity(0))
-    try:
-        with open("/sys/fs/cgroup/cpu.max") as f:
-            quota, period = f.read().split()
-        if quota != "max":
-            count = min(count, max(1, int(quota) // int(period)))
-    except (OSError, ValueError):
-        pass
-    return count
+def _upload_thread_count(num_threads: int | None) -> int:
+    """``num_threads``, else min(8, torch's intra-op threads); 1 to 16.
 
-
-def _upload_threads() -> int:
-    """Threads for the upload: TORCH_SPYRE_UPLOAD_THREADS, else min(8, CPUs)."""
-    value = os.environ.get(_UPLOAD_THREADS_ENV)
-    if value:
-        return max(1, int(value))
-    return min(_MAX_DEFAULT_UPLOAD_THREADS, _cpu_count())
+    torch's thread count is the share of CPUs a caller gave this process (for
+    example one TP rank's ``OMP_NUM_THREADS``).
+    """
+    if num_threads is None:
+        num_threads = min(_DEFAULT_UPLOAD_THREADS, torch.get_num_threads())
+    return max(1, min(num_threads, _MAX_UPLOAD_THREADS))
 
 
 def _start_upload_thread(device_index: int) -> None:
@@ -570,39 +587,60 @@ def _start_upload_thread(device_index: int) -> None:
     set_current_stream(get_stream_from_pool(device, 0))
 
 
-def _run_uploads(uploads: list[_Upload], counts: dict[str, int]) -> None:
-    """Run the uploads, then put the results into the modules in walk order.
-
-    Each upload writes to its own new device tensor, so uploads can run in any
-    order. The modules are only changed after all uploads are done, on this
-    thread.
-    """
-    threads = min(_upload_threads(), len(uploads))
-    if threads > 1:
-        with ThreadPoolExecutor(
-            max_workers=threads,
-            thread_name_prefix="spyre-upload",
-            initializer=_start_upload_thread,
-            initargs=(current_device(),),
-        ) as pool:
-            results = list(pool.map(lambda upload: upload.run(), uploads))
+def _put_upload(
+    upload: _Upload, result: tuple[torch.Tensor, str], counts: dict[str, int]
+) -> None:
+    dev, kind = result
+    counts[kind] += 1
+    if upload.requires_grad is None:
+        upload.module._buffers[upload.name] = dev
     else:
-        results = [upload.run() for upload in uploads]
+        upload.module._parameters[upload.name] = nn.Parameter(
+            dev, requires_grad=upload.requires_grad
+        )
 
-    for upload, (dev, kind) in zip(uploads, results):
-        counts[kind] += 1
-        if upload.requires_grad is None:
-            upload.module._buffers[upload.name] = dev
-        else:
-            upload.module._parameters[upload.name] = nn.Parameter(
-                dev, requires_grad=upload.requires_grad
-            )
+
+def _run_uploads(
+    uploads: list[_Upload], counts: dict[str, int], num_threads: int
+) -> None:
+    """Run the uploads and put each result into its module as it finishes.
+
+    The results are put in on this thread. Each upload writes to its own new
+    device tensor, so they can finish in any order, and each host tensor can be
+    freed once its result is in. Empties ``uploads``, which would hold them all.
+    If an upload fails, the ones not started are cancelled and the results
+    already put in stay on Spyre.
+    """
+    pending = deque(uploads)
+    uploads.clear()
+    threads = min(num_threads, len(pending))
+    if threads <= 1:
+        while pending:
+            upload = pending.popleft()
+            _put_upload(upload, upload.run(), counts)
+        return
+
+    with ThreadPoolExecutor(
+        max_workers=threads,
+        thread_name_prefix="spyre-upload",
+        initializer=_start_upload_thread,
+        initargs=(current_device(),),
+    ) as pool:
+        futures = {pool.submit(upload.run): upload for upload in pending}
+        pending.clear()
+        try:
+            for future in as_completed(futures):
+                _put_upload(futures.pop(future), future.result(), counts)
+        except BaseException:
+            pool.shutdown(cancel_futures=True)
+            raise
 
 
 def load_model_to_spyre(
     model: nn.Module,
     dtype: torch.dtype | None = None,
     use_fp8_weights: bool = False,
+    num_threads: int | None = None,
 ) -> nn.Module:
     """Transfer model to Spyre with optimal weight layout.
 
@@ -626,10 +664,12 @@ def load_model_to_spyre(
     Submodules that override ``_apply`` are honored, matching ``nn.Module.to``
     semantics.  Idempotent: parameters already on Spyre are skipped.
 
-    The uploads run on ``TORCH_SPYRE_UPLOAD_THREADS`` threads (default:
-    min(8, CPUs this process can use)); ``1`` uploads one tensor at a time.
-    Tensors of submodules that override ``_apply`` are always moved one at a
-    time, by that ``_apply``.
+    The uploads run on ``num_threads`` threads (default: min(8,
+    ``torch.get_num_threads()``); at most 16); ``1`` uploads one tensor at a
+    time. Each host tensor can be freed as soon as its upload is done.
+    Submodules that override ``_apply`` are moved by that ``_apply`` while the
+    model is walked, one tensor at a time, before the other uploads start. If
+    an upload fails, those and the uploads already done stay on Spyre.
 
     Args:
         model: Model to transfer to Spyre device.
@@ -639,6 +679,7 @@ def load_model_to_spyre(
         use_fp8_weights: If ``True``, ``torch.float8_e4m3fn`` Linear weights are
                          loaded with KERNEL layout and ``QFP8WT`` arrangement.
                          Use this for pre-quantized FP8 model checkpoints.
+        num_threads: Upload threads (optional); see above.
     """
     if dtype is not None:
         _validate_target_dtype(dtype)
@@ -648,7 +689,7 @@ def load_model_to_spyre(
     counts = {"linear": 0, "fp8_kernel": 0, "embedding": 0, "other": 0, "buffer": 0}
     uploads: list[_Upload] = []
     _transfer_module(model, dtype, uploads, use_fp8_weights=use_fp8_weights)
-    _run_uploads(uploads, counts)
+    _run_uploads(uploads, counts, _upload_thread_count(num_threads))
     logger.info(
         "load_model_to_spyre: %d Linear weights (dim_order=[1,0]), "
         "%d FP8 KERNEL weights, "
